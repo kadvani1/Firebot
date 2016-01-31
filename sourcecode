@@ -1,0 +1,176 @@
+/***************************************/
+bluetooth_util.h
+/***************************************/
+
+#include "mbed.h"
+#include "ble/BLE.h"
+#include "ble/services/HeartRateService.h"
+#include "ble/services/HealthThermometerService.h"
+#include "ble/services/BatteryService.h"
+#include "ble/services/DeviceInformationService.h"
+#include "ble/services/iBeacon.h"
+
+BLE  ble;
+DigitalOut led1(LED1);
+
+const static char     DEVICE_NAME[]        = "HRM1";
+static const uint16_t uuid16_list[]        = {GattService::UUID_HEART_RATE_SERVICE,
+                                              GattService::UUID_DEVICE_INFORMATION_SERVICE};
+static volatile bool  triggerSensorPolling = false;
+
+void disconnectionCallback(const Gap::DisconnectionCallbackParams_t *params)
+{
+    ble.gap().startAdvertising(); // restart advertising
+}
+
+void periodicCallback(void)
+{
+    led1 = !led1; /* Do blinky on LED1 while we're waiting for BLE events */
+    /* Note that the periodicCallback() executes in interrupt context, so it is safer to do
+     * heavy-weight sensor polling from the main thread. */
+    triggerSensorPolling = true;
+}
+
+
+/***************************************/
+sensor_util.h
+/***************************************/
+#include "mbed.h"
+#include "sensors/x_nucleo_iks01a1.h"
+
+static X_NUCLEO_IKS01A1 *mems_expansion_board = X_NUCLEO_IKS01A1::Instance(D14, D15);
+static GyroSensor *gyroscope = mems_expansion_board->GetGyroscope();
+static MotionSensor *accelerometer = mems_expansion_board->GetAccelerometer();
+static MagneticSensor *magnetometer = mems_expansion_board->magnetometer;
+static HumiditySensor *humidity_sensor = mems_expansion_board->ht_sensor;
+static PressureSensor *pressure_sensor = mems_expansion_board->pt_sensor;
+static TempSensor *temp_sensor1 = mems_expansion_board->ht_sensor;
+static TempSensor *temp_sensor2 = mems_expansion_board->pt_sensor;
+
+static char *printDouble(char* str, double v, int decimalDigits=2)
+{
+  int i = 1;
+  int intPart, fractPart;
+  int len;
+  char *ptr;
+
+  /* prepare decimal digits multiplicator */
+  for (;decimalDigits!=0; i*=10, decimalDigits--);
+
+  /* calculate integer & fractinal parts */
+  intPart = (int)v;
+  fractPart = (int)((v-(double)(int)v)*i);
+
+  /* fill in integer part */
+  sprintf(str, "%i.", intPart);
+
+  /* prepare fill in of fractional part */
+  len = strlen(str);
+  ptr = &str[len];
+
+  /* fill in leading fractional zeros */
+  for (i/=10;i>1; i/=10, ptr++) {
+    if(fractPart >= i) break;
+    *ptr = '0';
+  }
+
+  /* fill in (rest of) fractional part */
+  sprintf(ptr, "%i", fractPart);
+
+  return str;
+}
+
+void showSensors() {
+    float value1, value2;
+    char buffer1[32], buffer2[32];
+
+    while(1) {
+
+        temp_sensor1->GetTemperature(&value1);
+        humidity_sensor->GetHumidity(&value2);
+        pc.printf("HTS221: [temp] %7s°C,   [hum] %s%%\r\n", printDouble(buffer1, value1), printDouble(buffer2, value2));
+
+        temp_sensor2->GetFahrenheit(&value1);
+        pressure_sensor->GetPressure(&value2);
+        pc.printf("LPS25H: [temp] %7s°F, [press] %smbar\r\n", printDouble(buffer1, value1), printDouble(buffer2, value2));
+
+        pc.printf("---\r\n");
+
+        wait(1);
+    }
+}
+
+
+
+/***************************************/
+main
+/***************************************/
+#include "mbed.h"
+
+Serial pc(USBTX, USBRX); // tx, rx
+
+#include "sensor_util.h"
+#include "bluetooth_util.h"
+
+DigitalOut myled(LED1);
+
+void blink(float time) {
+   myled = 1;
+   wait(time);
+   myled = 0;
+}
+
+
+int main(void)
+{
+    float temperature;
+    temp_sensor1->GetTemperature(&temperature);
+
+   float humidity;
+   humidity_sensor->GetHumidity(&humidity);
+
+
+
+
+    led1 = 1;
+    Ticker ticker;
+    ticker.attach(periodicCallback, 1); // blink LED every second
+
+    ble.init();
+    ble.gap().onDisconnection(disconnectionCallback);
+
+    HealthThermometerService temperature_service(ble, temperature, HealthThermometerService::LOCATION_BODY);
+//  HealthThermometerService humidity_service(ble, humidity, HealthThermometerService::LOCATION_EAR);
+    DeviceInformationService deviceInfo(ble, "ARM", "Model1", "SN1", "hw-rev1", "fw-rev1", "soft-rev1");
+
+//    iBeacon::LocationUUID_t uuid {37};
+//    uint16_t majNum = 17;
+//    uint16_t minNum = 89;
+//
+//    iBeacon ib = iBeacon(ble, uuid, majNum, minNum);
+
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::COMPLETE_LIST_16BIT_SERVICE_IDS, (uint8_t *)uuid16_list, sizeof(uuid16_list));
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::GENERIC_THERMOMETER);
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::COMPLETE_LOCAL_NAME, (uint8_t *)DEVICE_NAME, sizeof(DEVICE_NAME));
+    ble.gap().setAdvertisingType(GapAdvertisingParams::ADV_CONNECTABLE_UNDIRECTED);
+    ble.gap().setAdvertisingInterval(1000);
+    ble.gap().startAdvertising();
+
+    // infinite loop
+    while (1) {
+        // check for trigger from periodicCallback()
+        if (triggerSensorPolling && ble.getGapState().connected) {
+            triggerSensorPolling = false;
+
+            temp_sensor1->GetTemperature(&temperature);
+            temperature_service.updateTemperature(temperature);
+
+             humidity_sensor->GetHumidity(&humidity);
+             humidity_service.updateTemperature(humidity);
+            wait(0.1);
+        } else {
+            ble.waitForEvent(); // low power wait for event
+        }
+    }
+}
